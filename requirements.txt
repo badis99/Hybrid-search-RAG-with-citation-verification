@@ -1,0 +1,11 @@
+numpy
+sentence-transformers
+rank-bm25
+tiktoken
+faiss-cpu
+python-dotenv
+
+# Phase 6 (generation) — add your LLM SDK, e.g.
+# openai
+# add when you reach Phase 9 (evaluation)
+# ragas
