@@ -242,7 +242,7 @@ the stub, then run its checkpoint before moving on.
 
 - [x] **Phase 0 — Setup.** Environment, project skeleton, corpus loader.
 - [x] **Phase 1 — Chunking.** Recursive splitting, overlap, stable chunk IDs.
-- [ ] **Phase 2 — Dense retrieval.** Embeddings, cosine similarity, ANN.
+- [x] **Phase 2 — Dense retrieval.** Embeddings, cosine similarity, ANN.
 - [ ] **Phase 3 — Sparse retrieval.** BM25, tokenization, exact-match strength.
 - [ ] **Phase 4 — Hybrid fusion.** Reciprocal Rank Fusion.
 - [ ] **Phase 5 — Reranking.** Cross-encoder, the two-stage pattern.
