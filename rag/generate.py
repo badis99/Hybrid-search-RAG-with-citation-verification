@@ -3,12 +3,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import anthropic
+from dotenv import load_dotenv
+from groq import Groq
 from pydantic import BaseModel
 
 from rag.ingest import Chunk
 
-MODEL = "claude-opus-4-8"
+load_dotenv()
+
+# The only model on this Groq account that supports strict json_schema output
+# (llama-3.3-70b and qwen3.6 reject it) — and the largest, so also the best at
+# following the grounding rules below.
+MODEL = "openai/gpt-oss-120b"
 
 SYSTEM_PROMPT = """You answer questions strictly from a numbered set of context passages.
 
@@ -29,6 +35,30 @@ Rules:
    a passage number that was not provided to you.
 5. answer_text is the prose answer for the reader. The claims list must cover the
    same facts, atomised."""
+
+# Hand-written rather than derived from the Pydantic model: strict mode requires
+# additionalProperties:false on every object, and an explicit schema makes what
+# the API enforces obvious.
+ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer_text": {"type": "string"},
+        "claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string"},
+                    "cited_chunks": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["claim", "cited_chunks"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["answer_text", "claims"],
+    "additionalProperties": False,
+}
 
 
 class Claim(BaseModel):
@@ -97,25 +127,33 @@ def resolve_citations(raw: RawAnswer, number_map: dict[int, str]) -> Answer:
 def generate(query: str, reranked_chunks: list[Chunk], model: str = MODEL) -> Answer:
     """Answer `query` grounded in `reranked_chunks`, with resolved citations.
 
-    Uses structured outputs so the response is constrained to the RawAnswer schema
-    — the "unparseable citations" failure mode is eliminated at the API level
-    rather than defended against with regex.
+    strict json_schema constrains the response shape, so the "unparseable
+    citations" failure mode is eliminated at the API level rather than defended
+    against with regex.
     """
     context, number_map = build_context(reranked_chunks)
-    client = anthropic.Anthropic()
-    response = client.messages.parse(
+    client = Groq()
+    response = client.chat.completions.create(
         model=model,
-        max_tokens=16000,
-        system=SYSTEM_PROMPT,
+        max_tokens=4096,
         messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": f"Context passages:\n\n{context}\n\nQuestion: {query}",
-            }
+            },
         ],
-        output_format=RawAnswer,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "grounded_answer",
+                "schema": ANSWER_SCHEMA,
+                "strict": True,
+            },
+        },
     )
-    return resolve_citations(response.parsed_output, number_map)
+    raw = RawAnswer.model_validate_json(response.choices[0].message.content)
+    return resolve_citations(raw, number_map)
 
 
 if __name__ == "__main__":
@@ -128,7 +166,7 @@ if __name__ == "__main__":
 
     queries = [
         "Who is the all-time top scorer in World Cup history?",  # in corpus
-        "Who won the 2026 World Cup?",                           # NOT in corpus
+        "Which country won the 2026 World Cup?",                 # NOT in corpus
     ]
     for query in queries:
         top = search_and_rerank(hybrid, reranker, query, top_n=5)
@@ -136,8 +174,9 @@ if __name__ == "__main__":
         answer = generate(query, chunks)
         print(f"\nQ: {query}")
         print(f"  abstained: {answer.abstained}")
-        print(f"  answer: {answer.answer_text}")
+        print(f"  answer   : {answer.answer_text}")
         for claim in answer.claims:
-            print(f"    - {claim.claim}  -> {claim.cited_chunk_ids}")
+            print(f"    - {claim.claim}")
+            print(f"      cites: {claim.cited_chunk_ids}")
         if answer.invalid_citations:
             print(f"  INVALID citations: {answer.invalid_citations}")
