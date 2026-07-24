@@ -1,15 +1,34 @@
 """Phase 6 — grounded generation with machine-parseable citations."""
 from __future__ import annotations
 
+import re
+import time
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, RateLimitError
 from pydantic import BaseModel
 
 from rag.ingest import Chunk
 
 load_dotenv()
+
+
+def call_with_backoff(make_request, attempts: int = 6):
+    """Retry a Groq call on 429, honouring the wait the error asks for.
+
+    The free tier caps tokens-per-minute, which any multi-question run trips.
+    Shared with the Phase 7 judge so both LLM callers pace themselves the same way.
+    """
+    for attempt in range(attempts):
+        try:
+            return make_request()
+        except RateLimitError as err:
+            if attempt == attempts - 1:
+                raise
+            match = re.search(r"try again in ([\d.]+)s", str(err))
+            time.sleep(float(match.group(1)) + 1.0 if match else 5.0 * (attempt + 1))
+    raise RuntimeError("unreachable")
 
 # The only model on this Groq account that supports strict json_schema output
 # (llama-3.3-70b and qwen3.6 reject it) — and the largest, so also the best at
@@ -133,24 +152,26 @@ def generate(query: str, reranked_chunks: list[Chunk], model: str = MODEL) -> An
     """
     context, number_map = build_context(reranked_chunks)
     client = Groq()
-    response = client.chat.completions.create(
-        model=model,
-        max_tokens=4096,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"Context passages:\n\n{context}\n\nQuestion: {query}",
+    response = call_with_backoff(
+        lambda: client.chat.completions.create(
+            model=model,
+            max_tokens=4096,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Context passages:\n\n{context}\n\nQuestion: {query}",
+                },
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "grounded_answer",
+                    "schema": ANSWER_SCHEMA,
+                    "strict": True,
+                },
             },
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "grounded_answer",
-                "schema": ANSWER_SCHEMA,
-                "strict": True,
-            },
-        },
+        )
     )
     raw = RawAnswer.model_validate_json(response.choices[0].message.content)
     return resolve_citations(raw, number_map)
