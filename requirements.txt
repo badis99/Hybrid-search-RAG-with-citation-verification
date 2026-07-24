@@ -5,7 +5,9 @@ tiktoken
 faiss-cpu
 python-dotenv
 
-# Phase 6 (generation) — add your LLM SDK, e.g.
-# openai
+# Phase 6 (generation) — Groq (OpenAI-compatible); needs GROQ_API_KEY in .env
+groq
+pydantic
+
 # add when you reach Phase 9 (evaluation)
 # ragas
