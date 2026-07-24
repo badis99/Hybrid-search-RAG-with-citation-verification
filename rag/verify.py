@@ -1,17 +1,15 @@
 """Phase 7 — citation verification: does the cited chunk actually support the claim?"""
 from __future__ import annotations
 
-import re
-import time
 from dataclasses import dataclass
 
 import numpy as np
 from dotenv import load_dotenv
-from groq import Groq, RateLimitError
+from groq import Groq
 from pydantic import BaseModel
 from sentence_transformers import CrossEncoder
 
-from rag.generate import Answer, ResolvedClaim
+from rag.generate import Answer, ResolvedClaim, call_with_backoff
 from rag.ingest import Chunk
 
 load_dotenv()
@@ -90,33 +88,25 @@ class LLMJudge:
         self.client = Groq()
         self.model = model
 
-    def _call(self, claim: str, premise: str, attempts: int = 6):
-        """Groq's free tier caps tokens-per-minute; the 429 tells us how long to
-        wait, so honour it rather than hammering."""
-        for attempt in range(attempts):
-            try:
-                return self.client.chat.completions.create(
-                    model=self.model,
-                    max_tokens=1024,
-                    messages=[
-                        {"role": "system", "content": JUDGE_SYSTEM},
-                        {"role": "user", "content": f"PASSAGE:\n{premise}\n\nCLAIM:\n{claim}"},
-                    ],
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "verdict",
-                            "schema": VERDICT_SCHEMA,
-                            "strict": True,
-                        },
+    def _call(self, claim: str, premise: str):
+        return call_with_backoff(
+            lambda: self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=1024,
+                messages=[
+                    {"role": "system", "content": JUDGE_SYSTEM},
+                    {"role": "user", "content": f"PASSAGE:\n{premise}\n\nCLAIM:\n{claim}"},
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "verdict",
+                        "schema": VERDICT_SCHEMA,
+                        "strict": True,
                     },
-                )
-            except RateLimitError as err:
-                if attempt == attempts - 1:
-                    raise
-                match = re.search(r"try again in ([\d.]+)s", str(err))
-                time.sleep(float(match.group(1)) + 1.0 if match else 5.0 * (attempt + 1))
-        raise RuntimeError("unreachable")
+                },
+            )
+        )
 
     def verify(self, claim: str, premise: str) -> Verification:
         response = self._call(claim, premise)
