@@ -14,10 +14,11 @@ then generate" and quietly trust that the model's citations are real. This one
 treats a citation as a claim to be verified, not a decoration — the quality
 layer that separates a demo from something you'd actually rely on.
 
-> This is a learning build. It is designed to be implemented one phase at a time,
-> understanding each layer before moving to the next. The repository ships with a
-> working environment, a corpus loader, a sample dataset, and typed stubs for
-> every remaining component. See the [Build roadmap](#build-roadmap).
+> This is a learning build, implemented one phase at a time. Phases 0–9 are
+> complete and measured: the pipeline runs end to end over a 20-document World Cup
+> corpus, and every component was evaluated rather than assumed useful — see
+> [Evaluation](#evaluation) for the ablation table, including the result that
+> *didn't* match expectations. See the [Build roadmap](#build-roadmap) for status.
 
 ---
 
@@ -130,35 +131,39 @@ hybrid-rag-citation-verification/
 ├── .gitignore
 ├── .env.example              # copy to .env for API keys (Phase 6+)
 ├── data/
-│   └── corpus/               # your source documents (.md / .txt / .json)
-│       └── *.md              # sample coffee-brewing docs ship here
+│   └── corpus/               # 20 World Cup documents (.md)
 ├── rag/
-│   ├── config.py             # every tunable knob, grouped by phase
-│   ├── ingest.py             # load_corpus() [done] + chunk_documents() [Phase 1]
+│   ├── config.py             # Config dataclass + the shared bi-encoder
+│   ├── ingest.py             # load_corpus() [Phase 0] + chunk_documents() [Phase 1]
 │   ├── dense.py              # DenseIndex               [Phase 2]
 │   ├── sparse.py             # SparseIndex (BM25)       [Phase 3]
 │   ├── fuse.py               # reciprocal_rank_fusion   [Phase 4]
 │   ├── rerank.py             # Reranker (cross-encoder) [Phase 5]
-│   ├── generate.py           # generate() + Claim model [Phase 6]
-│   ├── verify.py             # citation verification    [Phase 7]
+│   ├── generate.py           # generate() + citation resolution [Phase 6]
+│   ├── verify.py             # NLIVerifier + LLMJudge   [Phase 7]
 │   └── pipeline.py           # Pipeline.answer()        [Phase 8]
 ├── evaluation/
-│   └── metrics.py            # recall@k, MRR, nDCG      [Phase 9]
+│   ├── eval_set.py           # 30 labelled query -> gold chunk_id pairs
+│   ├── metrics.py            # recall@k, MRR, nDCG, the ablation  [Phase 9]
+│   └── FINDINGS.md           # filled tables + written analysis
 └── scripts/
     └── check_setup.py        # Phase 0 checkpoint
 ```
 
 Every stage is a small module with a clean input→output interface, so stages are
-independently testable and swappable. `load_corpus()` is fully implemented;
-everything downstream is a typed stub that raises `NotImplementedError` with a
-docstring describing what to build and the concepts to learn first.
+independently testable and swappable. That paid off concretely when generation
+switched LLM provider: only the transport inside `generate()` changed, while
+context building and citation resolution carried over untouched. Each module has a
+`__main__` block that runs its own phase checkpoint.
 
 ## Getting started
 
 ### Prerequisites
 
 - Python 3.11 or newer
-- (Phase 6+) an API key for an LLM provider, or a local model via Ollama
+- (Phase 6+) a `GROQ_API_KEY` in `.env` — generation and the LLM-judge verifier
+  run on Groq. Retrieval, reranking and the NLI verifier are all local and need
+  no key.
 
 ### Install
 
@@ -196,24 +201,32 @@ well, so you can tell when an answer is wrong.
 
 ## Usage
 
-Once the pipeline is implemented (Phase 8), the intended entry point is:
+Set `GROQ_API_KEY` in a `.env` file (needed from Phase 6 onward), then:
 
 ```python
 from rag.pipeline import Pipeline
 
-# Build the indexes once (chunk -> embed + BM25).
+# Build the indexes once (chunk -> embed + BM25) and load the models.
 pipeline = Pipeline().build()
 
-result = pipeline.answer("What makes cold brew less acidic than hot coffee?")
+result = pipeline.answer("Who is the all-time top scorer in World Cup history?")
 
-print(result.answer_text)
+print(result.answer)                      # "Miroslav Klose is the all-time leading..."
+print(f"faithfulness: {result.faithfulness:.2f}")
 for claim in result.verified_claims:
     print(f"  [supported {claim.score:.2f}] {claim.claim}")
 for claim in result.unsupported_claims:
     print(f"  [UNSUPPORTED] {claim.claim}")
 
-# result.debug holds every stage's intermediate output for inspection.
+# result.debug holds every stage's intermediate output — the ranked lists from
+# each retriever, the fused pool, the reranked top-n, the claims with their
+# citations, and every verdict. When an answer is wrong, this is how you find
+# which stage broke.
 ```
+
+Each module also runs standalone as its own checkpoint, e.g.
+`python rag/pipeline.py` traces several queries end to end, and
+`python evaluation/metrics.py` reproduces the ablation table below.
 
 ## Configuration
 
@@ -224,16 +237,19 @@ compare — that is the experiment loop.
 | --- | --- | --- | --- |
 | `chunk_size_tokens` | 300 | 1 | Target chunk length |
 | `chunk_overlap_tokens` | 45 | 1 | Overlap between chunks (~15%) |
-| `embedding_model` | `all-MiniLM-L6-v2` | 2 | Bi-encoder for dense retrieval |
-| `dense_top_k` | 50 | 2 | Dense candidates retrieved |
-| `sparse_top_k` | 50 | 3 | BM25 candidates retrieved |
+| *embedding model* | `BAAI/bge-small-en-v1.5` | 2 | Bi-encoder, loaded once in `config.py` |
+| `k_each` | 10 | 2/3 | Candidates retrieved *per retriever* |
 | `rrf_k` | 60 | 4 | RRF constant |
-| `fusion_pool_size` | 100 | 4 | Candidates handed to the reranker |
-| `reranker_model` | `ms-marco-MiniLM-L-6-v2` | 5 | Cross-encoder reranker |
+| `fusion_pool_size` | 20 | 4 | Candidates handed to the reranker |
+| *reranker model* | `ms-marco-MiniLM-L-6-v2` | 5 | Cross-encoder reranker |
 | `rerank_top_n` | 5 | 5 | Passages sent to the LLM |
-| `llm_model` | (set your own) | 6 | Generation model |
-| `nli_model` | `nli-deberta-v3-base` | 7 | NLI model for verification |
+| `llm_model` | `openai/gpt-oss-120b` | 6 | Generation model (via Groq) |
+| `verifier` | `nli` | 7 | `nli` (local, free) or `llm-judge` |
 | `verify_threshold` | 0.5 | 7 | Min entailment score to accept a claim |
+
+`k_each` and `fusion_pool_size` are smaller than a production setup would use
+because the corpus is only 21 chunks — retrieving 50 per retriever would return
+the entire corpus and make fusion meaningless.
 
 ## Build roadmap
 
@@ -243,13 +259,13 @@ the stub, then run its checkpoint before moving on.
 - [x] **Phase 0 — Setup.** Environment, project skeleton, corpus loader.
 - [x] **Phase 1 — Chunking.** Recursive splitting, overlap, stable chunk IDs.
 - [x] **Phase 2 — Dense retrieval.** Embeddings, cosine similarity, ANN.
-- [ ] **Phase 3 — Sparse retrieval.** BM25, tokenization, exact-match strength.
-- [ ] **Phase 4 — Hybrid fusion.** Reciprocal Rank Fusion.
-- [ ] **Phase 5 — Reranking.** Cross-encoder, the two-stage pattern.
-- [ ] **Phase 6 — Generation.** Grounded answers with parseable citations.
-- [ ] **Phase 7 — Verification.** NLI and LLM-judge; claim decomposition.
-- [ ] **Phase 8 — Pipeline.** Wire it together with a debug trace.
-- [ ] **Phase 9 — Evaluation.** Retrieval metrics, faithfulness, the ablation table.
+- [x] **Phase 3 — Sparse retrieval.** BM25, tokenization, exact-match strength.
+- [x] **Phase 4 — Hybrid fusion.** Reciprocal Rank Fusion.
+- [x] **Phase 5 — Reranking.** Cross-encoder, the two-stage pattern.
+- [x] **Phase 6 — Generation.** Grounded answers with parseable citations.
+- [x] **Phase 7 — Verification.** NLI and LLM-judge; claim decomposition.
+- [x] **Phase 8 — Pipeline.** Wire it together with a debug trace.
+- [x] **Phase 9 — Evaluation.** Retrieval metrics, faithfulness, the ablation table.
 - [ ] **Phase 10 — Iterate.** Query rewriting, parent-doc retrieval, context ordering.
 
 ## Evaluation
@@ -261,15 +277,47 @@ generation use them faithfully.
 chunk_id(s)` using Recall@k, MRR, and nDCG@k. The payoff is an ablation table
 that proves each component earns its place:
 
-| Config | Recall@10 | MRR | nDCG@10 |
-| --- | --- | --- | --- |
-| Dense only | | | |
-| Sparse only (BM25) | | | |
-| Hybrid (RRF) | | | |
-| Hybrid + rerank | | | |
+Measured on 30 labelled queries (8 paraphrase, 11 exact-term, 11 factual) over a
+21-chunk corpus:
+
+| Config | Recall@10 | MRR | nDCG@10 | Recall@1 | nDCG@5 |
+| --- | --- | --- | --- | --- | --- |
+| Dense only | 0.933 | 0.668 | 0.723 | 0.567 | 0.672 |
+| Sparse only (BM25) | **1.000** | **0.923** | **0.937** | **0.900** | **0.931** |
+| Hybrid (RRF) | 0.967 | 0.832 | 0.860 | 0.733 | 0.860 |
+| Hybrid + rerank | 0.967 | 0.872 | 0.892 | 0.800 | 0.892 |
+
+> **Read the `@10` columns with care at this corpus size.** Ten results is half of
+> a 21-chunk corpus, so Recall@10 compresses into 0.93–1.00 and barely separates
+> the configs. `hybrid + rerank` also returns only 5 passages by design, so it can
+> never score a hit at ranks 6–10. **Recall@1 and MRR are the columns with signal
+> here**, which is why they are included.
 
 Expected story: hybrid ≥ either single method, and reranking lifts precision the
-most. If it doesn't, that's a finding worth investigating.
+most. **That is not what happened** — sparse-only won outright. The cause is eval
+set composition, not a fusion bug: 22 of the 30 queries are proper-noun or
+rare-token shaped, which is BM25's home turf (a perfect 1.000 MRR on exact-term
+queries). RRF is a democratic average, so it cannot beat a dominant expert on that
+expert's ground. It *does* win the paraphrase category it exists for (0.802 vs
+0.795 dense / 0.781 sparse), but only 8 queries have that shape. Reranking did
+earn its place, improving every metric over hybrid.
+
+Full per-category breakdown and analysis: [`evaluation/FINDINGS.md`](evaluation/FINDINGS.md).
+
+**Verifier accuracy** on 20 labelled `(claim, chunk, supported?)` triples, with
+"supported" as the positive class:
+
+| Verifier | Precision | Recall | F1 | Accuracy |
+| --- | --- | --- | --- | --- |
+| NLI (`nli-deberta-v3-base`) | **1.000** | 0.600 | 0.750 | 0.800 |
+| LLM-judge (`gpt-oss-120b`) | **1.000** | 1.000 | 1.000 | 1.000 |
+
+Both reach **perfect precision — zero false positives.** That is the number this
+project cares about: a false positive is an unsupported claim reaching the user.
+They differ in recall — the NLI model errs strict, flagging 4 of 10 genuinely
+supported claims. The judge's flawless score deserves suspicion rather than
+celebration: 20 claims is a small set, and it shares a model family with the
+generator, so self-agreement likely inflates it.
 
 **Generation** is measured with faithfulness (are claims grounded?), answer
 relevance, and context precision/recall. [RAGAS](https://github.com/explodinggradients/ragas)
@@ -283,15 +331,21 @@ Chosen to run on a laptop (CPU is fine) and to be simple enough to learn from.
 Every choice is swappable — leaderboards move, the concepts don't, so always
 test on your own data.
 
-| Component | Starter | Upgrade path |
+| Component | In use here | Upgrade path |
 | --- | --- | --- |
-| Embeddings | `all-MiniLM-L6-v2` | `bge-small-en-v1.5` → `bge-m3` |
+| Embeddings | `BAAI/bge-small-en-v1.5` | `bge-m3` |
 | Vector index | numpy brute-force | `faiss-cpu`, `chromadb` |
 | Sparse | `rank_bm25` | `bm25s` |
 | Reranker | `ms-marco-MiniLM-L-6-v2` | `bge-reranker-v2-m3` |
-| Generation | any LLM API / Ollama | — |
+| Generation | `openai/gpt-oss-120b` via Groq | any provider — only the transport is coupled |
 | NLI verifier | `nli-deberta-v3-base` | fact-verification models, LLM-judge |
 | Evaluation | hand-rolled metrics | `ragas`, `deepeval` |
+
+BGE was chosen over `all-MiniLM-L6-v2` for retrieval quality, at the cost of
+needing a query instruction prefix — omit it and recall drops silently.
+`gpt-oss-120b` was picked because it is the only model on this Groq account that
+supports **strict `json_schema`** output, which is what makes citations
+guaranteed-parseable rather than regex-scraped.
 
 ## Extensions
 
